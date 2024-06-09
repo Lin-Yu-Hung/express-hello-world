@@ -1,61 +1,122 @@
-const express = require("express");
+const express = require('express');
+const Base64 = require('crypto-js/enc-base64');
+const { HmacSHA256 } = require('crypto-js');
+const axios = require('axios');
+const cors = require('cors');
 const app = express();
-const port = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3001;
 
-app.get("/", (req, res) => res.type('html').send(html));
+const { Server } = require('socket.io');
+const { createServer } = require('node:http');
+// 建立 HTTP 伺服器
+const server = createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: "*", // 或者指定你的前端 URL
+    methods: ["GET", "POST"],
+    allowedHeaders: ["my-custom-header"],
+    credentials: true
+  }, addTrailingSlash: false
+});
 
-const server = app.listen(port, () => console.log(`Example app listening on port ${port}!`));
+const userService = new Map();
 
-server.keepAliveTimeout = 120 * 1000;
-server.headersTimeout = 120 * 1000;
+function getRoomSize(roomId) {
+  const room = io.sockets.adapter.rooms.get(roomId);
+  return room ? room.size : 0;
+}
+function roomSizeMsg(roomId) {
+  const roomSize = getRoomSize(roomId);
+  io.to(roomId).emit("roomSize", roomSize);
+}
 
-const html = `
-<!DOCTYPE html>
-<html>
-  <head>
-    <title>Hello from Render!</title>
-    <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.5.1/dist/confetti.browser.min.js"></script>
-    <script>
-      setTimeout(() => {
-        confetti({
-          particleCount: 100,
-          spread: 70,
-          origin: { y: 0.6 },
-          disableForReducedMotion: true
-        });
-      }, 500);
-    </script>
-    <style>
-      @import url("https://p.typekit.net/p.css?s=1&k=vnd5zic&ht=tk&f=39475.39476.39477.39478.39479.39480.39481.39482&a=18673890&app=typekit&e=css");
-      @font-face {
-        font-family: "neo-sans";
-        src: url("https://use.typekit.net/af/00ac0a/00000000000000003b9b2033/27/l?primer=7cdcb44be4a7db8877ffa5c0007b8dd865b3bbc383831fe2ea177f62257a9191&fvd=n7&v=3") format("woff2"), url("https://use.typekit.net/af/00ac0a/00000000000000003b9b2033/27/d?primer=7cdcb44be4a7db8877ffa5c0007b8dd865b3bbc383831fe2ea177f62257a9191&fvd=n7&v=3") format("woff"), url("https://use.typekit.net/af/00ac0a/00000000000000003b9b2033/27/a?primer=7cdcb44be4a7db8877ffa5c0007b8dd865b3bbc383831fe2ea177f62257a9191&fvd=n7&v=3") format("opentype");
-        font-style: normal;
-        font-weight: 700;
-      }
-      html {
-        font-family: neo-sans;
-        font-weight: 700;
-        font-size: calc(62rem / 16);
-      }
-      body {
-        background: white;
-      }
-      section {
-        border-radius: 1em;
-        padding: 1em;
-        position: absolute;
-        top: 50%;
-        left: 50%;
-        margin-right: -50%;
-        transform: translate(-50%, -50%);
-      }
-    </style>
-  </head>
-  <body>
-    <section>
-      Hello from Render!
-    </section>
-  </body>
-</html>
-`
+io.on('connection', (socket) => {
+
+  socket.on('login', (info) => { // 加入聊天室
+    socket.join(socket.id);
+    const { name, roomId } = info;
+    if (!userService.has(`${roomId}${name}`)) {
+      io.to(socket.id).emit('loginStatus', true);
+    } else {
+      io.to(socket.id).emit('loginStatus', false);
+    }
+  });
+  socket.on('joinRoom', (info) => { // 加入聊天室
+    const { name, roomId } = info;
+    userService.set(`${roomId}${name}`, { info, id: socket.id })
+    socket.join(roomId);
+    io.to(roomId).emit('systemMsg', `${name}加入了聊天室!`);
+    roomSizeMsg(roomId)
+  });
+  socket.on('sendMessage', (messageInfo) => {
+    const { userName, roomId, message } = messageInfo
+    io.to(roomId).emit('returnMessage', { userName, message });
+  });
+  socket.on('leaveRoom', (info) => { // 離開聊天室
+    const { name, roomId, isReload } = info;
+    const leaveUser = userService.get(`${roomId}${name}`);
+    if (leaveUser && isReload) {
+      // 針對新開視窗做處理
+      // 將停留在原畫面的使用者一併做登出
+      io.to(leaveUser.id).emit('logout');
+      const room = io.sockets.adapter.rooms.get(roomId); // 將強制登出的使用者從room名單中移除
+      room.delete(leaveUser.id)
+    } else {
+      socket.leave(roomId);
+    }
+    roomSizeMsg(roomId)
+    io.to(roomId).emit('systemMsg', `${name}離開了聊天室!`);
+    userService.delete(`${roomId}${name}`)
+  });
+
+});
+
+
+app.use(express.json());
+app.use(cors());
+
+
+const createHeader = (uri, params) => {
+  const ChannelSecret = "080c23a52d12238f48e2d38044a2a09d";
+  const nonce = parseInt(new Date().getTime() / 1000);
+  const string = `${ChannelSecret}${uri}${JSON.stringify(params)}${nonce}`;
+  const hmacDigest = Base64.stringify(HmacSHA256(string, ChannelSecret));
+
+  return {
+    "Content-Type": "application/json",
+    'X-LINE-ChannelId': '2004505560',
+    'X-LINE-Authorization': hmacDigest,
+    "X-LINE-Authorization-Nonce": nonce
+  };
+};
+
+app.post('/linepay/request', async (req, res) => {
+  const requestBody = req.body;
+  const requestUri = "/v3/payments/request";
+  const headers = createHeader(requestUri, requestBody);
+  try {
+    const response = await axios.post(`https://sandbox-api-pay.line.me${requestUri}`, requestBody, { headers });
+    res.json(response.data);
+  } catch (error) {
+    res.status(error.response.status).json(error.response.data);
+  }
+});
+
+app.post('/payments/confirm', async (req, res) => {
+  const requestBody = req.body;
+  const { transactionId, amount, currency } = requestBody;
+  const requestUri = `/v3/payments/${transactionId}/confirm`;
+  const params = { amount, currency };
+  const headers = createHeader(requestUri, params);
+  try {
+    const response = await axios.post(`https://sandbox-api-pay.line.me${requestUri}`, params, { headers });
+    res.json(response.data);
+  } catch (error) {
+    res.status(error.response.status).json(error.response.data);
+  }
+});
+
+
+server.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
+});
